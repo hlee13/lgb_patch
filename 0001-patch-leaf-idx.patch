@@ -1,0 +1,239 @@
+From f2d25b4a3e00c55d82fb313d3308f7bf0635a5cf Mon Sep 17 00:00:00 2001
+From: nobody <nobody@nobody.com>
+Date: Mon, 4 Sep 2017 10:51:48 +0800
+Subject: [PATCH] patch leaf idx
+
+Signed-off-by: nobody <nobody@nobody.com>
+---
+ CMakeLists.txt                   |   1 +
+ include/LightGBM/boosting.h      |   4 ++
+ src/application/predictor.hpp    | 121 +++++++++++++++++++++++++++++++++++++++
+ src/boosting/gbdt.h              |   2 +
+ src/boosting/gbdt_prediction.cpp |  14 +++++
+ 5 files changed, 142 insertions(+)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c4b5e33..38477a7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -109,6 +109,7 @@ file(GLOB SOURCES
+ 
+ add_executable(lightgbm src/main.cpp ${SOURCES})
+ add_library(_lightgbm SHARED src/c_api.cpp src/lightgbm_R.cpp ${SOURCES})
++add_library(lightgbm-core src/c_api.cpp ${SOURCES})
+ 
+ if(MSVC)
+     set_target_properties(_lightgbm PROPERTIES OUTPUT_NAME "lib_lightgbm")
+diff --git a/include/LightGBM/boosting.h b/include/LightGBM/boosting.h
+index d49baf3..4385a36 100644
+--- a/include/LightGBM/boosting.h
++++ b/include/LightGBM/boosting.h
+@@ -138,6 +138,10 @@ public:
+   */
+   virtual void PredictLeafIndex(
+     const double* features, double* output) const = 0;
++  virtual void PredictLeafValue(
++    const double* features, double* output) const = 0;
++  
++  virtual void GetModelLeaves(int* output) const = 0;
+ 
+   /*!
+   * \brief Dump model to json format string
+diff --git a/src/application/predictor.hpp b/src/application/predictor.hpp
+index bfbc99c..64c0c9f 100644
+--- a/src/application/predictor.hpp
++++ b/src/application/predictor.hpp
+@@ -16,6 +16,8 @@
+ #include <string>
+ #include <memory>
+ 
++#include <assert.h>
++
+ namespace LightGBM {
+ 
+ /*!
+@@ -66,6 +68,14 @@ public:
+         ClearPredictBuffer(predict_buf_[tid].data(), predict_buf_[tid].size(), features);
+       };
+ 
++      predict_value_fun_ = [this](const std::vector<std::pair<int, double>>& features, double* output) {
++        int tid = omp_get_thread_num();
++        CopyToPredictBuffer(predict_buf_[tid].data(), features);
++        // get result for leaf value
++        boosting_->PredictLeafValue(predict_buf_[tid].data(), output);
++        ClearPredictBuffer(predict_buf_[tid].data(), predict_buf_[tid].size(), features);
++      };
++
+     } else {
+       if (is_raw_score) {
+         predict_fun_ = [this](const std::vector<std::pair<int, double>>& features, double* output) {
+@@ -101,6 +111,10 @@ public:
+   * \param result_filename Filename of output result
+   */
+   void Predict(const char* data_filename, const char* result_filename, bool has_header) {
++    if (predict_value_fun_) {
++        PredictLeafValue(data_filename, result_filename, has_header);
++        return;
++    }
+     FILE* result_file;
+ 
+     #ifdef _MSC_VER
+@@ -155,6 +169,112 @@ public:
+     fclose(result_file);
+   }
+ 
++  void PredictLeafValue(const char* data_filename, const char* result_filename, bool has_header) {
++    std::vector<int> num_leaves_vec(boosting_->NumberOfTotalModel());
++    boosting_->GetModelLeaves(num_leaves_vec.data());
++
++    int curr_idx = 0;
++    std::vector<int> tree_idx_beg_vec;
++    tree_idx_beg_vec.push_back(curr_idx);
++    for (size_t i = 1; i < num_leaves_vec.size(); i++) {
++        curr_idx += num_leaves_vec[i - 1];
++        tree_idx_beg_vec.push_back(curr_idx);
++    }
++
++    FILE* result_file;
++
++    #ifdef _MSC_VER
++    fopen_s(&result_file, result_filename, "w");
++    #else
++    result_file = fopen(result_filename, "wb");
++    #endif
++
++    if (result_file == NULL) {
++      Log::Fatal("Prediction results file %s doesn't exist", data_filename);
++    }
++    auto parser = std::unique_ptr<Parser>(Parser::CreateParser(data_filename, has_header, boosting_->MaxFeatureIdx() + 1, boosting_->LabelIdx()));
++
++    if (parser == nullptr) {
++      Log::Fatal("Could not recognize the data format of data file %s", data_filename);
++    }
++
++    // function for parse data
++    std::function<void(const char*, std::vector<std::pair<int, double>>*, double*)> parser_fun;
++    double tmp_label;
++    parser_fun = [this, &parser, &tmp_label]
++    (const char* buffer, std::vector<std::pair<int, double>>* feature, double* label) {
++      parser->ParseOneLine(buffer, feature, label);
++    };
++
++    std::function<void(data_size_t, const std::vector<std::string>&)> process_fun =
++      [this, &parser_fun, &result_file, &tree_idx_beg_vec]
++    (data_size_t, const std::vector<std::string>& lines) {
++      std::vector<std::pair<int, double>> oneline_features;
++      std::vector<std::string> result_to_write(lines.size());
++
++      std::vector<double> label_vec(lines.size());
++      std::vector<std::vector<int> > feat_idx_vec(lines.size());
++      std::vector<std::vector<double> > feat_val_vec(lines.size());
++      OMP_INIT_EX();
++      #pragma omp parallel for schedule(static) firstprivate(oneline_features)
++      for (data_size_t i = 0; i < static_cast<data_size_t>(lines.size()); ++i) {
++        OMP_LOOP_EX_BEGIN();
++        oneline_features.clear();
++
++        double label;
++        // parser
++        parser_fun(lines[i].c_str(), &oneline_features, &label);
++
++        // predict
++        std::vector<double> result(num_pred_one_row_);
++        predict_fun_(oneline_features, result.data());
++
++        // predict leaf value
++        std::vector<double>& result_value = feat_val_vec[i]; // (num_pred_one_row_);
++        result_value.resize(num_pred_one_row_);
++        predict_value_fun_(oneline_features, result_value.data());
++
++        assert(result.size() == result_value.size());
++
++        std::vector<int>& result_int = feat_idx_vec[i]; // (num_pred_one_row_);
++        result_int.resize(num_pred_one_row_);
++        for (size_t i = 0; i < result_value.size(); i++) {
++            int tree_idx = i;
++            int leaf_idx = result[i];
++
++            int feat_idx = tree_idx_beg_vec[tree_idx] + leaf_idx;
++            result_int[tree_idx] = feat_idx;
++        }
++
++        label_vec[i] = label;
++        OMP_LOOP_EX_END();
++      }
++      OMP_THROW_EX();
++
++      for (data_size_t i = 0; i < static_cast<data_size_t>(result_to_write.size()); ++i) {
++        std::vector<int>& result_int = feat_idx_vec[i]; // (num_pred_one_row_);
++        std::vector<double>& result_value = feat_val_vec[i]; // (num_pred_one_row_);
++
++        if (1 != fwrite(&label_vec[i], sizeof(double), 1, result_file)) {
++            fprintf(stderr, "fwrite %d error\n", i);
++        }
++        if (result_int.size() != fwrite(result_int.data(), sizeof(int), result_int.size(), result_file)) {
++            fprintf(stderr, "fwrite result_int %d error\n", i);
++        }
++        if (result_value.size() != fwrite(result_value.data(), sizeof(double), result_value.size(), result_file)) {
++            fprintf(stderr, "fwrite result_value %d error\n", i);
++        }
++      }
++    };
++
++    if (1 != fwrite(&num_pred_one_row_, sizeof(int), 1, result_file)) {
++        fprintf(stderr, "fwrite model_size error\n");
++    }
++    TextReader<data_size_t> predict_data_reader(data_filename, has_header);
++    predict_data_reader.ReadAllAndProcessParallel(process_fun);
++    fclose(result_file);
++  }
++
+ private:
+ 
+   void CopyToPredictBuffer(double* pred_buf, const std::vector<std::pair<int, double>>& features) {
+@@ -183,6 +303,7 @@ private:
+   const Boosting* boosting_;
+   /*! \brief function for prediction */
+   PredictFunction predict_fun_;
++  PredictFunction predict_value_fun_;
+   PredictionEarlyStopInstance early_stop_;
+   int num_feature_;
+   int num_pred_one_row_;
+diff --git a/src/boosting/gbdt.h b/src/boosting/gbdt.h
+index e776a26..0b911e1 100644
+--- a/src/boosting/gbdt.h
++++ b/src/boosting/gbdt.h
+@@ -154,6 +154,8 @@ public:
+                const PredictionEarlyStopInstance* earlyStop) const override;
+ 
+   void PredictLeafIndex(const double* features, double* output) const override;
++  void PredictLeafValue(const double* features, double* output) const override;
++  void GetModelLeaves(int* output) const override;
+ 
+   /*!
+   * \brief Dump model to json format string
+diff --git a/src/boosting/gbdt_prediction.cpp b/src/boosting/gbdt_prediction.cpp
+index 7928f39..7799181 100644
+--- a/src/boosting/gbdt_prediction.cpp
++++ b/src/boosting/gbdt_prediction.cpp
+@@ -40,4 +40,18 @@ void GBDT::PredictLeafIndex(const double* features, double* output) const {
+   }
+ }
+ 
++void GBDT::PredictLeafValue(const double* features, double* output) const {
++  int total_tree = num_iteration_for_pred_ * num_tree_per_iteration_;
++  for (int i = 0; i < total_tree; ++i) {
++    output[i] = models_[i]->Predict(features);
++  }
++}
++
++void GBDT::GetModelLeaves(int* output) const {
++  int total_tree = num_iteration_for_pred_ * num_tree_per_iteration_;
++  for (int i = 0; i < total_tree; ++i) {
++    output[i] = models_[i]->num_leaves();
++  }
++}
++
+ }  // namespace LightGBM
+-- 
+2.14.1
